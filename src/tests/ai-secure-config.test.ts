@@ -60,9 +60,11 @@ describe('AI model config secure storage', () => {
 
     saveModelConfig({ type: 'openai', model: 'gpt-4o-mini', api_key: 'sk-openai' });
     expect(loadModelConfig().type).toBe('openai');
-    expect(loadCustomModelSettings(loadModelConfig())).toEqual({
+    // 自定义接口信息被完整保留：地址、模型，以及指向多接口条目的 customProviderId
+    expect(loadCustomModelSettings(loadModelConfig())).toMatchObject({
       endpoint: 'https://custom.example/v1', model: 'my-model',
     });
+    expect(loadCustomModelSettings(loadModelConfig()).customProviderId).toBeTruthy();
     expect(loadProviderKey('custom')).toBe('sk-custom');
     expect(store.get('ai_assistant_custom_model_settings')).not.toContain('sk-custom');
     expect(localStorage.getItem('ai_assistant_custom_model_settings')).toBeNull();

@@ -14,6 +14,7 @@ import {
 import { cn } from '@/lib/utils';
 import i18n from "@/i18n";
 import { getSecureItem, setSecureItem, removeSecureItem } from '@/lib/secureStorage';
+import { migrateLegacyCustomProvider } from '@/ai-v2/customProviders';
 
 // ── 模型类型（从 aiTypes 导入，在此仅重导出供外部使用）──────────────────────────────
 export type { ModelType };
@@ -224,16 +225,24 @@ export function loadModelConfig(): ModelConfig {
       if (cfg && cfg.type === 'wenxin') {
         return { type: 'deepseek' };
       }
+      // 旧版本只有一套自定义接口：迁移为多接口条目并绑定 ID
+      if (cfg && cfg.type === 'custom' && !cfg.customProviderId) {
+        const migrated = migrateLegacyCustomProvider(cfg);
+        if (migrated !== cfg) {
+          try { setSecureItem(MODEL_CONFIG_KEY, JSON.stringify(migrated)); } catch { /* ignore */ }
+        }
+        return migrated;
+      }
       return cfg;
     }
   } catch { /* ignore */ }
   return { type: 'deepseek' };
 }
 
-export function loadCustomModelSettings(config: ModelConfig): Pick<ModelConfig, 'endpoint' | 'model' | 'supportsTools' | 'supportsVision' | 'stream'> {
+export function loadCustomModelSettings(config: ModelConfig): Pick<ModelConfig, 'endpoint' | 'model' | 'supportsTools' | 'supportsVision' | 'stream' | 'customProviderId'> {
   if (config.type === 'custom') {
-    const { endpoint, model, supportsTools, supportsVision, stream } = config;
-    return { endpoint, model, supportsTools, supportsVision, stream };
+    const { endpoint, model, supportsTools, supportsVision, stream, customProviderId } = config;
+    return { endpoint, model, supportsTools, supportsVision, stream, customProviderId };
   }
   try {
     const raw = getSecureItem(CUSTOM_MODEL_SETTINGS_KEY);
@@ -248,8 +257,8 @@ export function saveModelConfig(cfg: ModelConfig): void {
   if (cfg.type !== 'custom') {
     const previous = loadModelConfig();
     if (previous.type === 'custom') {
-      const { endpoint, model, api_key, supportsTools, supportsVision, stream } = previous;
-      setSecureItem(CUSTOM_MODEL_SETTINGS_KEY, JSON.stringify({ endpoint, model, supportsTools, supportsVision, stream }));
+      const { endpoint, model, api_key, supportsTools, supportsVision, stream, customProviderId } = previous;
+      setSecureItem(CUSTOM_MODEL_SETTINGS_KEY, JSON.stringify({ endpoint, model, supportsTools, supportsVision, stream, customProviderId }));
       if (api_key) setSecureItem('ai_api_key_custom', api_key);
     }
   }

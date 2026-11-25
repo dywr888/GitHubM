@@ -17,6 +17,15 @@ import {
   testProviderConnection,
 } from '@/components/ai/aiProviders';
 import type { ModelConfig } from '@/components/ai/aiTypes';
+import {
+  deleteCustomProvider as removeCustomProvider,
+  fetchProviderModels,
+  loadCustomProviders,
+  patchCustomProvider,
+  providerDisplayName,
+  upsertCustomProvider,
+} from '@/ai-v2/customProviders';
+import type { CustomProvider } from '@/ai-v2/customProviders';
 import { getModelCapabilities } from '@/ai-v2/modelCapabilities';
 import { clearArtifacts, listArtifacts } from '@/ai-v2/artifacts';
 import { clearRuns, listRuns } from '@/ai-v2/runStore';
@@ -63,6 +72,7 @@ import {
   KeyRound,
   Loader2,
   Network,
+  Pencil,
   Plus,
   RefreshCw,
   Save,
@@ -192,6 +202,11 @@ export default function AiSettingsPage() {
   const [modelsState, setModelsState] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [modelsError, setModelsError] = useState('');
   const [fetchedModels, setFetchedModels] = useState<Array<{ id: string; name: string }>>([]);
+  const [customProviders, setCustomProviders] = useState<CustomProvider[]>(() => loadCustomProviders());
+  /** 新建/编辑中的自定义接口草稿；null 表示未在编辑 */
+  const [customDraft, setCustomDraft] = useState<{ id?: string; name: string; endpoint: string; apiKey: string } | null>(null);
+  const [customDraftError, setCustomDraftError] = useState('');
+  const [customDraftState, setCustomDraftState] = useState<'idle' | 'saving' | 'fetching'>('idle');
   const requestGeneration = useRef(0);
   const [storageVersion, setStorageVersion] = useState(0);
 
@@ -231,8 +246,12 @@ export default function AiSettingsPage() {
       toast.error(i18n.t('请先填写 API Key'));
       return;
     }
-    if (validateProvider && def.needEndpoint && !next.endpoint?.trim()) {
-      toast.error(i18n.t('请先填写接口地址'));
+    if (validateProvider && next.type === 'custom' && !next.customProviderId) {
+      toast.error(i18n.t('请先添加并选择一个自定义接口'));
+      return;
+    }
+    if (validateProvider && next.type === 'custom' && !next.model?.trim()) {
+      toast.error(i18n.t('请为自定义接口选择一个模型'));
       return;
     }
     saveModelConfig(next);
@@ -244,17 +263,37 @@ export default function AiSettingsPage() {
   const changeProvider = (type: ModelConfig['type']) => {
     const saved = loadModelConfig();
     const savedKey = (type === saved.type && saved.api_key) || loadProviderKey(type);
-    const custom = type === 'custom' ? loadCustomModelSettings(saved) : undefined;
+    if (type === 'custom') {
+      // 自定义接口优先沿用上次选中的条目；没有就取第一条并自动填充
+      const list = loadCustomProviders();
+      const bound = list.find(item => item.id === saved.customProviderId) || list[0];
+      setConfig(prev => ({
+        ...prev,
+        type,
+        customProviderId: bound?.id,
+        endpoint: bound?.endpoint,
+        api_key: bound?.apiKey ?? (savedKey || undefined),
+        supportsTools: bound?.supportsTools,
+        supportsVision: bound?.supportsVision,
+        stream: bound?.stream,
+        model: bound?.models[0] || saved.model || '',
+      }));
+      setFetchedModels(bound ? bound.models.map(id => ({ id, name: id })) : []);
+      setModelsState(bound && bound.models.length ? 'success' : 'idle');
+      setTestState('idle');
+      setTestResult('');
+      return;
+    }
     setConfig(prev => ({
       ...prev,
       type,
       api_key: savedKey || undefined,
-      ...custom,
-      endpoint: custom?.endpoint,
-      supportsTools: custom?.supportsTools,
-      supportsVision: custom?.supportsVision,
-      stream: custom?.stream,
-      model: custom?.model || getDefaultProviderModel(type),
+      customProviderId: undefined,
+      endpoint: undefined,
+      supportsTools: undefined,
+      supportsVision: undefined,
+      stream: undefined,
+      model: getDefaultProviderModel(type),
     }));
     setTestState('idle');
     setTestResult('');
@@ -304,6 +343,126 @@ export default function AiSettingsPage() {
       setModelsState('error');
       setModelsError((error as Error).message || i18n.t('获取失败'));
     }
+  };
+
+  // ── 自定义接口（多条）──────────────────────────────────────────────────────
+  const beginCustomDraft = (provider?: CustomProvider) => {
+    setCustomDraftError('');
+    setCustomDraft(provider
+      ? { id: provider.id, name: provider.name, endpoint: provider.endpoint, apiKey: provider.apiKey ?? '' }
+      : { name: '', endpoint: '', apiKey: '' });
+  };
+
+  const closeCustomDraft = () => {
+    setCustomDraft(null);
+    setCustomDraftError('');
+  };
+
+  /**
+   * 保存一条自定义接口：地址和 Key 通过校验后先落库，
+   * 再自动请求上游 /models 拉取模型列表（失败不影响已保存的接口）。
+   */
+  const saveCustomDraft = async () => {
+    if (!customDraft) return;
+    const endpoint = customDraft.endpoint.trim();
+    if (!endpoint) {
+      setCustomDraftError(i18n.t('请填写接口地址'));
+      return;
+    }
+    if (!/^https?:\/\//i.test(endpoint)) {
+      setCustomDraftError(i18n.t('接口地址需以 http:// 或 https:// 开头'));
+      return;
+    }
+    setCustomDraftError('');
+    setCustomDraftState('saving');
+    let saved: CustomProvider;
+    try {
+      saved = upsertCustomProvider({
+        id: customDraft.id,
+        name: customDraft.name.trim(),
+        endpoint,
+        apiKey: customDraft.apiKey.trim(),
+        // 地址变化时旧模型列表不可信，先清空再由拉取结果覆盖
+        ...(customDraft.id ? {} : { models: [] }),
+      });
+    } catch (error) {
+      setCustomDraftState('idle');
+      setCustomDraftError((error as Error).message || i18n.t('保存失败'));
+      return;
+    }
+
+    setCustomDraftState('fetching');
+    try {
+      const updated = await fetchProviderModels(saved.id);
+      setCustomProviders(loadCustomProviders());
+      setCustomDraftState('idle');
+      closeCustomDraft();
+      toast.success(updated.models.length
+        ? i18n.t('已保存并拉取到 {{count}} 个模型', { count: updated.models.length })
+        : i18n.t('已保存，但上游未返回模型'));
+      applyCustomProvider(updated);
+    } catch (error) {
+      setCustomProviders(loadCustomProviders());
+      setCustomDraftState('idle');
+      // 接口本身已保存成功，仅提示拉取失败，避免用户重复输入
+      closeCustomDraft();
+      toast.error(i18n.t('接口已保存，但拉取模型失败：{{msg}}', { msg: (error as Error).message || '' }));
+      applyCustomProvider(saved);
+    }
+  };
+
+  /** 把某条接口设为当前可用模型来源 */
+  const applyCustomProvider = (provider: CustomProvider, fallbackModel?: string) => {
+    const next: ModelConfig = {
+      ...config,
+      type: 'custom',
+      customProviderId: provider.id,
+      endpoint: provider.endpoint,
+      api_key: provider.apiKey,
+      model: provider.models[0] || fallbackModel || config.model || '',
+      supportsTools: provider.supportsTools,
+      supportsVision: provider.supportsVision,
+      stream: provider.stream,
+    };
+    setConfig(next);
+    saveModelConfig(next);
+    setFetchedModels(provider.models.map(id => ({ id, name: id })));
+    setModelsState(provider.models.length ? 'success' : 'idle');
+  };
+
+  const refreshCustomProvider = async (id: string) => {
+    try {
+      const updated = await fetchProviderModels(id);
+      setCustomProviders(loadCustomProviders());
+      if (config.customProviderId === id) setFetchedModels(updated.models.map(m => ({ id: m, name: m })));
+      toast.success(i18n.t('已更新模型列表（{{count}} 个）', { count: updated.models.length }));
+    } catch (error) {
+      toast.error(i18n.t('拉取模型失败：{{msg}}', { msg: (error as Error).message || '' }));
+    }
+  };
+
+  const removeCustomProviderById = async (provider: CustomProvider) => {
+    const confirmed = await confirmAction({
+      title: i18n.t('删除这个接口？'),
+      description: i18n.t('“{{name}}”及其 API Key 会从本机移除，无法恢复。', { name: providerDisplayName(provider) }),
+      confirmText: i18n.t('删除'),
+    });
+    if (!confirmed) return;
+    const next = removeCustomProvider(provider.id);
+    setCustomProviders(next);
+    if (config.customProviderId === provider.id) {
+      const fallback = next[0];
+      if (fallback) {
+        applyCustomProvider(fallback);
+      } else {
+        const cleared: ModelConfig = { ...config, type: 'custom', customProviderId: undefined, endpoint: undefined, api_key: undefined, model: '' };
+        setConfig(cleared);
+        saveModelConfig(cleared);
+        setFetchedModels([]);
+        setModelsState('idle');
+      }
+    }
+    toast.success(i18n.t('已删除接口'));
   };
 
   const clearSessions = async () => {
@@ -415,10 +574,16 @@ export default function AiSettingsPage() {
     // 内置模型清单 + 从上游拉取到的模型（按 id 去重，拉取到的优先展示）
     const modelOptions = (() => {
       const merged = new Map<string, { value: string; label: string }>();
+      // 自定义接口的模型持久化在条目里，直接读，避免被临时状态重置
+      if (config.type === 'custom' && config.customProviderId) {
+        const bound = customProviders.find(item => item.id === config.customProviderId);
+        bound?.models.forEach(id => merged.set(id, { value: id, label: id }));
+      }
       fetchedModels.forEach(model => merged.set(model.id, { value: model.id, label: model.name || model.id }));
       (def.models || []).forEach(model => {
         if (!merged.has(model.value)) merged.set(model.value, { value: model.value, label: model.label });
       });
+      if (config.model && !merged.has(config.model)) merged.set(config.model, { value: config.model, label: config.model });
       return Array.from(merged.values());
     })();
     return (
@@ -441,21 +606,113 @@ export default function AiSettingsPage() {
             </Select>
           </SettingRow>
 
-          {def.needEndpoint && (
-            <SettingRow label={i18n.t('接口地址')} desc={i18n.t('兼容 OpenAI Chat Completions 格式；填到 /v1 即可，保存时会自动补全。')}>
-              <Input
-                className="px-3"
-                placeholder="http://127.0.0.1:17890/v1 或 https://api.example.com/v1/chat/completions"
-                value={config.endpoint || ''}
-                onChange={event => setConfig(prev => ({ ...prev, endpoint: event.target.value }))}
-              />
-            </SettingRow>
+          {config.type === 'custom' && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <Label className="text-sm font-normal">{i18n.t('自定义接口')}</Label>
+                  <p className="mt-0.5 text-[11px] leading-5 text-muted-foreground">
+                    {i18n.t('可添加任意多个兼容 OpenAI 的接口，填好地址与 API Key 后自动拉取模型。')}
+                  </p>
+                </div>
+                <Button type="button" size="sm" variant="outline" className="h-8 shrink-0 gap-1 px-2.5 text-xs" onClick={() => beginCustomDraft()}>
+                  <Plus className="h-3.5 w-3.5" />
+                  {i18n.t('添加接口')}
+                </Button>
+              </div>
+
+              {customProviders.length === 0 && !customDraft && (
+                <div className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-[11px] text-muted-foreground">
+                  {i18n.t('还没有自定义接口，点击「添加接口」开始配置。')}
+                </div>
+              )}
+
+              {customProviders.length > 0 && (
+                <div className="space-y-1.5">
+                  {customProviders.map(provider => {
+                    const active = config.customProviderId === provider.id;
+                    return (
+                      <div
+                        key={provider.id}
+                        className={cn(
+                          'rounded-lg border px-2.5 py-2',
+                          active ? 'border-primary/35 bg-primary/10' : 'border-border bg-muted/20',
+                        )}
+                      >
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => applyCustomProvider(provider)}
+                            className="min-w-0 flex-1 text-left"
+                          >
+                            <span className="block truncate text-xs font-medium">{providerDisplayName(provider)}</span>
+                            <span className="block truncate font-mono text-[10px] text-muted-foreground">{provider.endpoint}</span>
+                          </button>
+                          {active && <Badge variant="secondary" className="shrink-0 px-1.5 py-0 text-[9px]">{i18n.t('使用中')}</Badge>}
+                          <Button type="button" variant="ghost" size="icon" className="h-7 w-7 shrink-0" title={i18n.t('拉取模型')} onClick={() => void refreshCustomProvider(provider.id)}>
+                            <RefreshCw className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button type="button" variant="ghost" size="icon" className="h-7 w-7 shrink-0" title={i18n.t('编辑')} onClick={() => beginCustomDraft(provider)}>
+                            <Pencil className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button type="button" variant="ghost" size="icon" className="h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive" title={i18n.t('删除')} onClick={() => void removeCustomProviderById(provider)}>
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                        <p className="mt-1 truncate text-[10px] text-muted-foreground">
+                          {provider.models.length > 0
+                            ? i18n.t('{{count}} 个模型', { count: provider.models.length })
+                            : i18n.t('暂无模型，可点击刷新拉取')}
+                          {provider.modelsFetchedAt ? ` · ${new Date(provider.modelsFetchedAt).toLocaleString()}` : ''}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {customDraft && (
+                <div className="space-y-2.5 rounded-lg border border-primary/25 bg-primary/5 p-3">
+                  <p className="text-xs font-medium">{customDraft.id ? i18n.t('编辑接口') : i18n.t('新建接口')}</p>
+                  <Input
+                    className="h-9 px-3 text-xs"
+                    placeholder={i18n.t('名称（可选，如 本地 Ollama）')}
+                    value={customDraft.name}
+                    onChange={event => setCustomDraft(prev => prev && { ...prev, name: event.target.value })}
+                  />
+                  <Input
+                    className="h-9 px-3 font-mono text-xs"
+                    placeholder="https://api.example.com/v1"
+                    value={customDraft.endpoint}
+                    onChange={event => setCustomDraft(prev => prev && { ...prev, endpoint: event.target.value })}
+                  />
+                  <Input
+                    className="h-9 px-3 font-mono text-xs"
+                    type="text"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    placeholder={i18n.t('API Key（免鉴权接口可留空）')}
+                    value={customDraft.apiKey}
+                    onChange={event => setCustomDraft(prev => prev && { ...prev, apiKey: event.target.value })}
+                  />
+                  {customDraftError && <p className="break-words text-[11px] text-destructive">{customDraftError}</p>}
+                  <div className="flex justify-end gap-2">
+                    <Button type="button" variant="outline" size="sm" className="h-8 px-2.5 text-xs" onClick={closeCustomDraft} disabled={customDraftState !== 'idle'}>
+                      {i18n.t('取消')}
+                    </Button>
+                    <Button type="button" size="sm" className="h-8 gap-1 px-2.5 text-xs" onClick={() => void saveCustomDraft()} disabled={customDraftState !== 'idle'}>
+                      {customDraftState === 'idle' ? <Save className="h-3.5 w-3.5" /> : <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                      {customDraftState === 'fetching' ? i18n.t('拉取模型中…') : customDraftState === 'saving' ? i18n.t('保存中…') : i18n.t('保存并拉取模型')}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
           )}
 
-          {(def.needKey || config.type === 'custom') && (
-            <SettingRow label="API Key" desc={config.type === 'custom'
-              ? i18n.t('免鉴权接口可留空，将直接请求自定义地址。')
-              : i18n.t('Android 使用系统 Keystore 加密，Web 使用浏览器存储；不会上传到服务器。')}>
+          {def.needKey && config.type !== 'custom' && (
+            <SettingRow label="API Key" desc={i18n.t('Android 使用系统 Keystore 加密，Web 使用浏览器存储；不会上传到服务器。')}>
               <div className="flex gap-2">
                 <Input
                   className="min-w-0 flex-1 px-3"
@@ -482,27 +739,50 @@ export default function AiSettingsPage() {
                 <Switch
                   aria-label={i18n.t('支持工具')}
                   checked={config.supportsTools ?? false}
-                  onCheckedChange={supportsTools => setConfig(prev => ({ ...prev, supportsTools }))}
+                  onCheckedChange={supportsTools => {
+                    setConfig(prev => ({ ...prev, supportsTools }));
+                    if (config.customProviderId) {
+                      patchCustomProvider(config.customProviderId, { supportsTools });
+                      setCustomProviders(loadCustomProviders());
+                    }
+                  }}
                 />
               </SettingRow>
               <SettingRow label={i18n.t('支持图片')}>
                 <Switch
                   aria-label={i18n.t('支持图片')}
                   checked={config.supportsVision ?? getModelCapabilities('custom', config.model).supportsVision}
-                  onCheckedChange={supportsVision => setConfig(prev => ({ ...prev, supportsVision }))}
+                  onCheckedChange={supportsVision => {
+                    setConfig(prev => ({ ...prev, supportsVision }));
+                    if (config.customProviderId) {
+                      patchCustomProvider(config.customProviderId, { supportsVision });
+                      setCustomProviders(loadCustomProviders());
+                    }
+                  }}
                 />
               </SettingRow>
               <SettingRow label={i18n.t('流式输出')}>
                 <Switch
                   aria-label={i18n.t('流式输出')}
                   checked={config.stream !== false}
-                  onCheckedChange={stream => setConfig(prev => ({ ...prev, stream }))}
+                  onCheckedChange={stream => {
+                    setConfig(prev => ({ ...prev, stream }));
+                    if (config.customProviderId) {
+                      patchCustomProvider(config.customProviderId, { stream });
+                      setCustomProviders(loadCustomProviders());
+                    }
+                  }}
                 />
               </SettingRow>
             </>
           )}
 
-          <SettingRow label={i18n.t('默认模型')} desc={i18n.t('点击右侧「拉取」可直接从当前 Provider 获取可用模型，选择后保存生效。')}>
+          <SettingRow
+            label={i18n.t('默认模型')}
+            desc={config.type === 'custom'
+              ? i18n.t('模型来自所选接口自动拉取的结果；可继续手动输入模型 ID。')
+              : i18n.t('点击右侧「拉取」可直接从当前 Provider 获取可用模型，选择后保存生效。')}
+          >
             <div className="flex items-center gap-2">
               <Select
                 value={config.model || modelOptions[0]?.value || ''}
@@ -517,14 +797,17 @@ export default function AiSettingsPage() {
                   ))}
                 </SelectContent>
               </Select>
-              {/* 拉取上游模型：自定义接口没有内置模型清单，靠它把上游 /models 拿回来 */}
+              {/* 拉取上游模型：自定义接口在保存时会自动拉取，这里用于手动刷新 */}
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
                 className="h-9 shrink-0 gap-1.5 px-2.5 text-xs"
-                onClick={handleFetchModels}
-                disabled={modelsState === 'loading'}
+                onClick={() => {
+                  if (config.type === 'custom' && config.customProviderId) void refreshCustomProvider(config.customProviderId);
+                  else void handleFetchModels();
+                }}
+                disabled={modelsState === 'loading' || (config.type === 'custom' && !config.customProviderId)}
               >
                 {modelsState === 'loading'
                   ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -532,6 +815,11 @@ export default function AiSettingsPage() {
                 {modelsState === 'loading' ? i18n.t('拉取中…') : i18n.t('拉取模型')}
               </Button>
             </div>
+            {config.type === 'custom' && !config.customProviderId && (
+              <p className="mt-2 rounded-lg bg-muted/30 px-2.5 py-2 text-[11px] leading-5 text-muted-foreground">
+                {i18n.t('请先在上方「自定义接口」中选择一条接口，模型列表会自动填充。')}
+              </p>
+            )}
             {modelsState === 'error' && (
               <p className="break-words text-[11px] text-destructive">{modelsError}</p>
             )}

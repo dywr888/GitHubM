@@ -186,6 +186,12 @@ export interface ModelConfig {
   type: ModelType;
   api_key?: string;
   endpoint?: string;
+  /**
+   * 自定义接口条目 ID（type === 'custom' 时生效）。
+   * 指向 ai-v2/customProviders 中保存的一条接口；请求前由
+   * resolveCustomProviderConfig() 还原成真实的 endpoint / api_key / model。
+   */
+  customProviderId?: string;
   /** 无状态模型代理地址（Cloudflare Worker），配置后所有模型请求走代理 */
   proxy_url?: string;
   /** Agent 编排引擎：仅保留 LangGraph */

@@ -57,8 +57,12 @@ import {
 } from '@/components/ai/aiUtils';
 import { getDefaultProviderModel } from '@/components/ai/aiProviders';
 import type { ModelType } from '@/components/ai/aiTypes';
-import { getModelCapabilities } from '@/ai-v2/modelCapabilities';
 import type { ModelConfig } from '@/components/ai/aiTypes';
+import { getModelCapabilities } from '@/ai-v2/modelCapabilities';
+import {
+  listCustomProviderModels,
+  resolveCustomModelConfig,
+} from '@/ai-v2/customProviders';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import type { GitHubRepo } from '@/types/types';
 import { Button } from '@/components/ui/button';
@@ -1055,22 +1059,32 @@ export default function AiAssistantV2Page({ visible = true, compactKeyboard = fa
       : sessionType === modelConfig.type ? modelConfig.model || '' : defaultProviderModel
   );
   const sessionApiKey = (sessionType === modelConfig.type ? modelConfig.api_key : loadProviderKey(sessionType)) || '';
-  const sessionEndpoint = sessionType === 'custom' ? customSettings.endpoint : undefined;
   const effectiveConfig = useMemo<ModelConfig>(() => {
     const capabilities = getModelCapabilities(sessionType, sessionModel);
-    return {
-      ...modelConfig, type: sessionType, model: sessionModel, api_key: sessionApiKey, endpoint: sessionEndpoint,
+    const base: ModelConfig = {
+      ...modelConfig, type: sessionType, model: sessionModel, api_key: sessionApiKey,
       stream: sessionType === 'custom' ? customSettings.stream : undefined,
       supportsTools: sessionType === 'custom' ? customSettings.supportsTools ?? capabilities.supportsTools : capabilities.supportsTools,
       supportsVision: sessionType === 'custom' ? customSettings.supportsVision ?? capabilities.supportsVision : capabilities.supportsVision,
+      endpoint: sessionType === 'custom' ? customSettings.endpoint : undefined,
+      customProviderId: sessionType === 'custom' ? customSettings.customProviderId : undefined,
     };
-  }, [modelConfig, sessionType, sessionModel, sessionApiKey, sessionEndpoint, customSettings]);
+    // 自定义接口：按模型反查所属条目，拿到真实 endpoint / api_key
+    return sessionType === 'custom' ? resolveCustomModelConfig(base, sessionModel) : base;
+  }, [modelConfig, sessionType, sessionModel, sessionApiKey, customSettings]);
+  const sessionEndpoint = effectiveConfig.endpoint;
   const pickerProviders = useMemo(() => MODEL_DEFS.map(provider => {
-    if (provider.type !== 'custom' || !customSettings.endpoint?.trim()) return provider;
-    const models = new Set([customModel]);
-    if (sessionType === 'custom' && sessionModel) models.add(sessionModel);
-    return { ...provider, models: [...models].map(value => ({ value, label: value })) };
-  }), [customSettings.endpoint, customModel, sessionType, sessionModel]);
+    if (provider.type !== 'custom') return provider;
+    // 自定义接口条目可能有多条，把所有拉取到的模型聚合到「自定义接口」分组
+    const collected = listCustomProviderModels();
+    const models = new Map<string, { value: string; label: string }>();
+    collected.forEach(item => models.set(item.value, { value: item.value, label: item.value }));
+    [customModel, sessionType === 'custom' ? sessionModel : ''].forEach(value => {
+      if (value) models.set(value, { value, label: value });
+    });
+    if (models.size === 0) return provider;
+    return { ...provider, models: [...models.values()] };
+  }), [customSettings, customModel, sessionType, sessionModel]);
   const binding = useMemo(() => runBinding(repoContext, effectiveConfig), [repoContext, effectiveConfig]);
   const modelDef = providerDef;
   const hasModelKey = sessionType === 'custom' || Boolean(effectiveConfig.api_key?.trim());
@@ -1654,7 +1668,7 @@ export default function AiAssistantV2Page({ visible = true, compactKeyboard = fa
     }
     if (!hasModelKey || needsCustomEndpoint) {
       navigate('/ai-settings/model');
-      toast.error(needsCustomEndpoint ? i18n.t('请先填写接口地址') : i18n.t('请先配置模型 API Key'));
+      toast.error(needsCustomEndpoint ? i18n.t('请先在模型设置中添加并选择自定义接口') : i18n.t('请先配置模型 API Key'));
       return;
     }
 
@@ -2261,7 +2275,7 @@ export default function AiAssistantV2Page({ visible = true, compactKeyboard = fa
             >
               <Settings className="h-4 w-4 shrink-0" />
               <span className="flex-1">{needsCustomEndpoint
-                ? i18n.t('请先填写接口地址')
+                ? i18n.t('请先在模型设置中添加并选择自定义接口')
                 : i18n.t('还没有配置模型，点击选择 DeepSeek / OpenRouter / Gemini')}</span>
               <ChevronRight className="h-4 w-4 shrink-0" />
             </button>

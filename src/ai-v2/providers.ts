@@ -2,6 +2,7 @@
 import { normalizeChatEndpoint } from '@/lib/ai-endpoint';
 import type { ModelConfig } from '@/components/ai/aiTypes';
 import { getModelCapabilities } from './modelCapabilities';
+import { resolveCustomProviderConfig } from './customProviders';
 import type {
   AgentEvent,
   ProviderStreamResult,
@@ -109,6 +110,8 @@ export function buildProviderRequest(
   messages: V2ProviderMessage[],
   tools: V2ToolDefinition[],
 ): { url: string; headers: Record<string, string>; body: Record<string, unknown> } {
+  // 自定义接口只保存了条目 ID，发请求前解析回真实的地址 / Key / 模型
+  config = resolveCustomProviderConfig(config);
   const { url, proxy } = getRequestUrl(config);
   if (!url) throw new Error('请先在模型设置中填写接口地址');
   const apiKey = config.api_key?.trim();
